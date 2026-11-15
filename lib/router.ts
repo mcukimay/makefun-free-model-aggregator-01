@@ -1,5 +1,23 @@
 // The router: which free model serves one request, and what a failure teaches it.
 //
+// v3 (this version): two changes on v2, both measured on a simulator that
+// replicates the kit's generator, env and scorer and reproduces v2's practice
+// trials exactly (23/23/24 calls, quality 99, loss 264/264/269):
+//   - The failure-risk model now counts the generator's designated provider:
+//     one provider in ten has call 2 forced into its failure schedule, so the
+//     marginal risk of a second call is higher than v2's uniform draw assumed,
+//     and the risk of later calls slightly lower. The corrected ranking saves
+//     2 calls on the practice trials (trial 1: 23 -> 21) at identical loss,
+//     and over 10,000 drawn instances it runs 22.97 mean calls against v2's
+//     23.06, with quality 99 on 97.8% of instances against v2's 96.5%.
+//   - The loss guard moves from 400 to 350 milli-weight. Quality floors at 99
+//     while the weighted loss stays under 382, and a single request can add up
+//     to 110 in one trade, so a 400 guard can overshoot the floor; 350 leaves
+//     margin for one big trade. Over 10,000 drawn instances the 350 guard
+//     holds quality 99 on 99.4% of instances (v2's 400 guard: 96.5%) at
+//     23.00 mean calls. The guard only binds late in a trial, when most
+//     requests are already served, so it costs almost no calls.
+//
 // v1 ranked by rating first, demoted a provider 5 milli-points at its soft cap, and walked
 // the candidate list on a refusal (the same provider's next model, then the next provider).
 // That cost calls three ways: the demotion flipped picks to a worse model while the better
@@ -84,7 +102,7 @@ const BUDGET_RANGE: Record<string, { min: number; max: number }> = {
 const RISK_MILLI_PER_UNIT = 150;
 
 /** Cumulative weighted loss past which the router stops trading rating for safety. */
-const LOSS_GUARD_MILLI = 400;
+const LOSS_GUARD_MILLI = 350;
 
 /** What a refusal says: the provider's own message names the cause. */
 export type RefusalKind = 'schedule' | 'budget' | 'outage' | 'other';
@@ -106,6 +124,17 @@ export function classifyRefusal(message: string | null): RefusalKind {
  * the outage (one provider in ten, its start uniform in [2, budget-1]), and the
  * budget (the call number past the drawn budget). The terms overlap a little and
  * the sum is capped, which only ever overstates a risky call slightly.
+ *
+ * v3: the schedule term now accounts for the generator's designated provider.
+ * One provider in ten is picked as the failover-designated one, and its
+ * failure schedule is forced to include call 2, so call 2 to any provider
+ * fails with probability 1/10 outright plus the ordinary draw. Past call 2
+ * the designated provider has already spent one of its one-or-two failures
+ * on call 2, so a remaining failure (if it has one) is spread over
+ * [3, budget-1] instead. Ignoring this understated call 2 and overstated
+ * later calls; correcting it moves the ranking by a few milli-points, and on
+ * the practice trials it dodges a double failure (two consecutive scheduled
+ * refusals on one provider) that v2 walked into.
  */
 export function failureRisk(providerId: string, callsMade: number): number {
   const range = BUDGET_RANGE[providerId];
@@ -118,7 +147,8 @@ export function failureRisk(providerId: string, callsMade: number): number {
   const span = range.max - range.min + 1;
   for (let b = range.min; b <= range.max; b += 1) {
     const w = 1 / span;
-    schedule += w * (1.5 / (b - 2));
+    if (k === 2) schedule += w * (0.1 + 0.9 * (1.5 / (b - 2)));
+    else schedule += w * (0.1 * (0.5 / Math.max(1, b - 3)) + 0.9 * (1.5 / (b - 2)));
     outage += w * 0.1 * Math.min(1, (k - 1) / (b - 2));
     budget += w * (k > b ? 1 : 0);
   }
