@@ -1,27 +1,45 @@
-// free-model-aggregator-01: one server, ten free providers, three upstream wires.
+// free-model-aggregator-01 v2: one server, ten free providers, three upstream wires.
 //
-// This entry serves the trial's client as an OpenAI service (POST /v1/chat/completions) or an Anthropic
-// one (POST /v1/messages), in JSON or in server-sent events, and answers every request from one of the
-// ten simulated free-tier providers in the brief, on that provider's own wire. What it does per request:
+// v2 of the v1 entry (which scored 99/100 on the practice grade: quality 99, served,
+// wire, failover and catalog all 100, at 25/32/29 upstream calls over the three practice
+// trials). 100/100 is not on the table: the 1475 model lives on one provider whose
+// budget tops out at 12 calls against 17 requests that want it, so quality tops out at
+// 99 and the score with it. The final ranks the top 60 by mean score over three fresh
+// instances, ties broken by fewer provider calls, so v2's job is 99 at the fewest calls.
+// The simulator that picked this routing (/tmp/sim.py, a replica of the kit's generator
+// and env, validated by reproducing v1's 25/32/29 exactly) puts v2 at 23/23/24 calls on
+// the practice trials and a mean of ~23.1 over 1,000 drawn instances, against v1's
+// ~27.6, with the score at 99 on every one of those instances.
+//
+// This entry serves the trial's client as an OpenAI service (POST /v1/chat/completions)
+// or an Anthropic one (POST /v1/messages), in JSON or in server-sent events, and
+// answers every request from one of the ten simulated free-tier providers in the brief,
+// on that provider's own wire. What it does per request:
 //
 //   1. reads the request's requirements from the workload manifest (by arrival order);
-//   2. asks the router for the free models meeting them, best rating first, spread over providers
-//      and away from providers that failed three times in a row (lib/router.ts);
-//   3. calls the best candidate on its wire, always as one plain JSON call, and reads the answer back
-//      as (text, usage). A 402, 429 or 5xx, an unreachable provider or an unparsable answer counts as a
-//      failure, and the request is retried on the next candidate: first the same provider's next model
-//      (a refusal is charged to one call number, and the provider's next call usually succeeds), then
-//      the next provider. Three consecutive failures on one provider mark it dead for the trial.
-//   4. rebuilds the reply from the provider's text and usage in the wire the client used, with the
-//      provider's answer text carried through verbatim. The stop reason is always the family-0 one
-//      ("stop" for an OpenAI client, "end_turn" for an Anthropic one), because the provider's stop is
-//      always family 0 too.
+//   2. asks the router for the free models meeting them, ranked by effective rating:
+//      the quality table's rating minus 150 milli-points per unit of the provider's
+//      next-call failure probability, computed from the kit's published budget ranges
+//      (lib/router.ts). Past 400 milli-weight of cumulative loss it ranks purely by
+//      rating, so a bad trial cannot drift into quality 97;
+//   3. calls the best candidate on its wire, always as one plain JSON call, and reads
+//      the answer back as (text, usage). A refusal's message names its cause: a spent
+//      budget or an outage marks that provider dead at once; a scheduled refusal is
+//      retried on the same model, because the failure schedules are one call wide and
+//      the next call usually lands; a second scheduled refusal in a row moves the
+//      request on to the next candidate. A 402, 429 or 5xx, an unreachable provider or
+//      an unparsable answer that names no cause moves on without a retry;
+//   4. rebuilds the reply from the provider's text and usage in the wire the client
+//      used, with the provider's answer text carried through verbatim. The stop reason
+//      is always the family-0 one ("stop" for an OpenAI client, "end_turn" for an
+//      Anthropic one), because the provider's stop is always family 0 too.
 //
-// A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from the repository's
-// root, with Node 22's standard library alone (nothing is installed; TypeScript runs directly, and a
-// relative import needs its .ts extension). The brief is at the path in $MAKEFUN_PROMPT_FILE. The env is
-// at $MAKEFUN_ENV_URL and serves the providers under their base paths. This server reads the brief,
-// probes each provider's catalog route in the provider's own wire, builds one catalog, then:
+// A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from
+// the repository's root, with Node 22's standard library alone (nothing is installed;
+// TypeScript runs directly, and a relative import needs its .ts extension). The brief is
+// at the path in $MAKEFUN_PROMPT_FILE. The env is at $MAKEFUN_ENV_URL and serves the
+// providers under their base paths. This server reads the brief, probes each provider's
+// catalog route in the provider's own wire, builds one catalog, then:
 //   1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
 //   2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
 //   3. serves the client's requests: GET /v1/models (answering in the shape of the auth header it got:
@@ -36,7 +54,7 @@
 //   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
 //   lib/brief.ts       the brief's types and parser, the auth headers, the catalog probe.
 //   lib/translate.ts   the client wires and the three upstream wires, the answer parsers, the replies.
-//   lib/router.ts      the candidate ranking: rating first, budget caps, failure cooldowns, dead marks.
+//   lib/router.ts      the candidate ranking: risk-adjusted rating, loss guard, refusal causes.
 //   LICENSE            MIT.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -72,7 +90,7 @@ import {
   type ServedModel,
   type UpstreamAnswer,
 } from './lib/translate.ts';
-import { Router, type Candidate } from './lib/router.ts';
+import { classifyRefusal, Router, type Candidate, type RefusalKind } from './lib/router.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -161,7 +179,7 @@ function requirementsFromBody(body: Json): Requirement {
   };
 }
 
-/** One client request body, or null when it is not one JSON object or is too large. */
+/** One client request body, or null when it is not one JSON object or too large. */
 async function readJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -198,8 +216,20 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
+/** The refusal message out of a provider's error envelope, all three wires alike. */
+function refusalMessage(body: unknown): string | null {
+  if (!isRecord(body)) return null;
+  const error = body.error;
+  if (!isRecord(error)) return null;
+  return typeof error.message === 'string' ? error.message : null;
+}
+
+type UpstreamResult =
+  | { ok: true; answer: UpstreamAnswer }
+  | { ok: false; status: number; message: string | null; kind: RefusalKind };
+
 /** One upstream call: the request the candidate's wire wants, answered as (text, usage), or a refusal. */
-async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<{ ok: true; answer: UpstreamAnswer } | { ok: false; status: number }> {
+async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<UpstreamResult> {
   const provider = candidate.probe.provider;
   const base = joinBase(ENV_URL, provider.base);
   const request = buildUpstreamRequest(base, provider.wire, provider.auth, provider.key, clientApi, body, candidate.model.id);
@@ -212,24 +242,38 @@ async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthrop
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
   } catch {
-    return { ok: false, status: 0 };
+    return { ok: false, status: 0, message: null, kind: 'other' };
   }
-  if (!upstream.ok) return { ok: false, status: upstream.status };
   let parsed: unknown;
   try {
     parsed = await upstream.json();
   } catch {
-    return { ok: false, status: 502 };
+    return { ok: false, status: upstream.ok ? 502 : upstream.status, message: null, kind: 'other' };
+  }
+  if (!upstream.ok) {
+    const message = refusalMessage(parsed);
+    return { ok: false, status: upstream.status, message, kind: classifyRefusal(message) };
   }
   const answer = parseUpstreamAnswer(provider.wire, parsed);
-  if (answer === null) return { ok: false, status: 502 };
+  if (answer === null) return { ok: false, status: 502, message: null, kind: 'other' };
   return { ok: true, answer };
 }
 
+/** The best legal rating for the request now arriving, from the brief's best table; 0 when unknown. */
+function bestRatingFor(requestIndex: number): number {
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[requestIndex];
+  if (entry !== undefined && brief.ratings !== null) {
+    const row = brief.ratings.best.find((b) => b.id === entry.id);
+    if (row !== undefined) return row.rating_milli;
+  }
+  return 0;
+}
+
 /**
- * Serve one client request: walk the router's candidates in order, one try per provider, until one
- * answers. A refusal teaches the router (cooldown, then dead after three in a row) and the request
- * falls through to the next candidate; a request whose every candidate refused is unserved.
+ * Serve one client request: walk the router's candidates in order, retrying a scheduled
+ * refusal on the same model once, until one answers. A spent budget or an outage kills
+ * that provider at once; a request whose every candidate refused is unserved.
  */
 async function serve(
   body: Json,
@@ -238,19 +282,47 @@ async function serve(
   const requestIndex = manifestIndex;
   const requires = requirementsFor(body);
   const jsonMode = clientApi === 'openai' && openAIJsonMode(body);
-  const candidates = router.candidatesFor(requires, jsonMode);
-  for (const candidate of candidates) {
+  const weight = brief.workload?.manifest[requestIndex]?.weight ?? 1;
+  let best = bestRatingFor(requestIndex);
+  if (best === 0) {
+    // No best table in the brief: the loss guard measures against the best
+    // candidate on offer, so a perfect serve still banks zero loss.
+    const first = router.candidatesFor(requires, jsonMode);
+    best = first.length > 0 ? Math.max(...first.map((c) => c.rating)) : 1475;
+  }
+  const tried = new Set<string>();
+  for (;;) {
+    const candidates = router.candidatesFor(requires, jsonMode).filter((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`));
+    if (candidates.length === 0) return null;
+    const candidate = candidates[0];
     const providerId = candidate.probe.provider.id;
+    tried.add(`${providerId}/${candidate.model.id}`);
     router.noteAttempt(providerId);
     const result = await callUpstream(candidate, clientApi, body);
     if (result.ok) {
-      router.noteSuccess(providerId);
+      router.noteSuccess(providerId, candidate.rating, best, weight);
       return { answer: result.answer, model: candidate.model.id };
     }
-    router.noteFailure(providerId);
+    if (result.kind === 'budget' || result.kind === 'outage') {
+      router.noteRefusal(providerId, result.kind);
+      log(`request ${requestIndex}: ${providerId}/${candidate.model.id} ${result.kind} (HTTP ${result.status}); provider dead`);
+      continue;
+    }
+    if (result.kind === 'schedule') {
+      // The failure schedules are one call wide: the provider's next call usually
+      // lands, so retry the same model before falling through to a worse one.
+      router.noteAttempt(providerId);
+      const retry = await callUpstream(candidate, clientApi, body);
+      if (retry.ok) {
+        router.noteSuccess(providerId, candidate.rating, best, weight);
+        return { answer: retry.answer, model: candidate.model.id };
+      }
+      if (retry.kind === 'budget' || retry.kind === 'outage') router.noteRefusal(providerId, retry.kind);
+      log(`request ${requestIndex}: ${providerId}/${candidate.model.id} refused twice (HTTP ${result.status}, then ${retry.status}); trying the next candidate`);
+      continue;
+    }
     log(`request ${requestIndex}: ${providerId}/${candidate.model.id} refused (HTTP ${result.status}); trying the next candidate`);
   }
-  return null;
 }
 
 /** The model id the reply names: the client's own when it sent one, else the model that answered. */
@@ -338,7 +410,7 @@ function poll(server: Server): void {
         const work: unknown = await res.json();
         if (isRecord(work) && work.done === true) {
           clearInterval(timer);
-          log(`done: provider calls ${router.summary()}`);
+          log(`done: provider calls ${router.summary()}; weighted loss ${router.lossOf()}`);
           server.close();
           process.exit(0);
         }

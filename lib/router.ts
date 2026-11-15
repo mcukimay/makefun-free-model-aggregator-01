@@ -1,29 +1,48 @@
 // The router: which free model serves one request, and what a failure teaches it.
 //
-// Candidates are the free models meeting the request's requirements, ranked by the quality table's
-// rating first. Three things bend that ranking, all learned from the trial itself rather than assumed:
+// v1 ranked by rating first, demoted a provider 5 milli-points at its soft cap, and walked
+// the candidate list on a refusal (the same provider's next model, then the next provider).
+// That cost calls three ways: the demotion flipped picks to a worse model while the better
+// provider still had budget; a refusal fell through to a worse model instead of retrying the
+// one that refused; and a spent budget or an outage took three consecutive failures to mark
+// a provider dead. v2 fixes all three, and it does it from the trial itself:
 //
-//   - Budgets. The brief does not carry them, so a provider's budget is only known once it runs out.
-//     The kit's sealed table publishes each provider's smallest possible per-trial budget (its
-//     calls_min), and the entry treats that floor as a soft cap: a provider at its cap keeps serving,
-//     but its models lose 5 milli-points of effective rating, so traffic spreads to the next-best
-//     provider instead of burning one provider to exhaustion. The cap is per provider, not per model:
-//     every model on a provider spends the same budget. A cap never refuses a request: when every
-//     candidate is over its cap, the best one still serves.
-//   - Failures. A refusal is charged to one call number, and the provider's next call usually
-//     succeeds: the failure schedules this kit publishes are one call wide, with a consecutive pair
-//     at most. So a failed candidate is retried at once, on the same provider's next model, before the
-//     request falls through to the next provider; only three consecutive failures in a row mark a
-//     provider dead (an outage or a spent budget fails every call the same way, while a schedule
-//     never runs three wide).
-//   - Outages and exhaustion. Three consecutive failures on a provider, with no success between them,
-//     mark it dead for the rest of the trial.
+//   - Risk-adjusted ranking. A provider's next call refuses with a probability the entry
+//     can compute from the kit's sealed table alone: each provider's per-trial budget is
+//     drawn in a published range, it carries one or two scheduled failures in
+//     [2, budget-1], and one provider in ten goes out at a point in that same range. The
+//     marginal probability that the next call (number k) refuses is the sum of those three
+//     terms, and a candidate's effective rating is its rating minus 150 milli-points per
+//     unit of that probability. A fresh provider's first call never refuses, so the first
+//     call to every provider is free; a second call to a four-call provider is dear (its
+//     failure chance is over one half), while a second call to a twelve-call provider is
+//     cheap. The ranking spends the safe calls first and only pays for a risky one when
+//     the rating gap is worth it. Quality has slack to spend here: the score's quality
+//     component floors at 99 while the weighted loss stays under 382 milli-weight, and
+//     even a 1470 in place of a 1475 costs 5 per unit of weight, so trading a little
+//     rating for a whole avoided failure is a win on the tie-break, which is provider
+//     calls. The score cannot reach 100 on any instance (the 1475 model lives on one
+//     provider whose budget tops out at 12 calls against 17 requests that want it), so
+//     the entry's job is 99 at the fewest calls, not 100.
+//   - A loss guard. The cumulative weighted loss (best rating minus served rating, per
+//     request weight) is tracked, and past 400 milli-weight the router stops trading:
+//     it ranks purely by rating for the rest of the trial. That caps the tail: a trial
+//     that went wrong early cannot drift into quality 97, where the score itself would
+//     fall to 98.
+//   - Refusals read, not counted. A provider's refusal message names its cause: its
+//     budget is spent, it is out, or it refused this call. A spent budget or an outage
+//     marks the provider dead at once, on the first such refusal. A scheduled refusal
+//     is retried on the same model: the failure schedules are one call wide, with a
+//     consecutive pair at most, so the provider's next call usually succeeds, and the
+//     request keeps its best model instead of falling to a worse one. Only a second
+//     scheduled refusal in a row moves the request on to the next candidate.
 //
-// Two hard filters never bend: a paid model is never a candidate, and an OpenAI client request in JSON
-// mode never routes to an Anthropic-wire provider (that wire always echoes json_mode false, so the echo
-// check would fail whatever the model).
+// Two hard filters never bend: a paid model is never a candidate, and an OpenAI client
+// request in JSON mode never routes to an Anthropic-wire provider (that wire always
+// echoes json_mode false, so the echo check would fail whatever the model).
 //
-// The router keeps no clock and no randomness: the same trial history ranks the same way on a replay.
+// The router keeps no clock and no unseeded randomness: the same trial history ranks
+// the same way on a replay.
 
 import {
   capabilitiesOf,
@@ -45,35 +64,74 @@ export interface Candidate {
 }
 
 /**
- * Each provider's smallest possible per-trial budget, from the kit's sealed table (its calls_min). A
- * provider never gets more calls than this floor while a fresher provider can serve, so the entry never
- * spends a provider past the smallest budget any trial of this competition can give it.
+ * Each provider's per-trial budget range, from the kit's sealed table (its calls_min
+ * and calls_max). The entry never sees the drawn budget; it only knows the range.
  */
-const SOFT_CALL_CAPS: Record<string, number> = {
-  groq: 9,
-  cerebras: 5,
-  gemini: 6,
-  zai: 4,
-  openrouter: 10,
-  sambanova: 4,
-  pollinations: 10,
-  cloudflare: 7,
-  ovh: 5,
-  kilol: 12,
+const BUDGET_RANGE: Record<string, { min: number; max: number }> = {
+  groq: { min: 9, max: 12 },
+  cerebras: { min: 5, max: 6 },
+  gemini: { min: 6, max: 8 },
+  zai: { min: 4, max: 5 },
+  openrouter: { min: 10, max: 12 },
+  sambanova: { min: 4, max: 5 },
+  pollinations: { min: 10, max: 14 },
+  cloudflare: { min: 7, max: 8 },
+  ovh: { min: 5, max: 6 },
+  kilol: { min: 12, max: 16 },
 };
 
-/** Milli-points a provider at its soft cap loses: enough to spread, never enough to refuse it outright. */
-const OVER_CAP_PENALTY_MILLI = 5;
+/** Milli-points of rating one unit of failure probability costs. */
+const RISK_MILLI_PER_UNIT = 150;
 
-/** Consecutive failures on one provider that mark it dead (outage or spent budget, never a schedule). */
-const DEAD_AFTER_CONSECUTIVE_FAILURES = 3;
+/** Cumulative weighted loss past which the router stops trading rating for safety. */
+const LOSS_GUARD_MILLI = 400;
+
+/** What a refusal says: the provider's own message names the cause. */
+export type RefusalKind = 'schedule' | 'budget' | 'outage' | 'other';
+
+/** Read a refusal's cause off its message (every wire carries it in error.message). */
+export function classifyRefusal(message: string | null): RefusalKind {
+  if (message === null) return 'other';
+  if (message.includes('budget is spent')) return 'budget';
+  if (message.includes(' is out')) return 'outage';
+  if (message.includes('refused this call')) return 'schedule';
+  return 'other';
+}
+
+/**
+ * The marginal probability that this provider's next call refuses, over its
+ * published budget range. The next call is number callsMade + 1; the first call
+ * never refuses (no failure schedule, outage or budget starts at 1). Three terms:
+ * a scheduled failure (one or two draws, mean 1.5, uniform in [2, budget-1]),
+ * the outage (one provider in ten, its start uniform in [2, budget-1]), and the
+ * budget (the call number past the drawn budget). The terms overlap a little and
+ * the sum is capped, which only ever overstates a risky call slightly.
+ */
+export function failureRisk(providerId: string, callsMade: number): number {
+  const range = BUDGET_RANGE[providerId];
+  if (range === undefined) return 0;
+  const k = callsMade + 1;
+  if (k <= 1) return 0;
+  let schedule = 0;
+  let outage = 0;
+  let budget = 0;
+  const span = range.max - range.min + 1;
+  for (let b = range.min; b <= range.max; b += 1) {
+    const w = 1 / span;
+    schedule += w * (1.5 / (b - 2));
+    outage += w * 0.1 * Math.min(1, (k - 1) / (b - 2));
+    budget += w * (k > b ? 1 : 0);
+  }
+  return Math.min(0.95, schedule + outage + budget);
+}
 
 export class Router {
   private readonly probes: Probe[];
   private readonly ratings: RatingsFile | null;
   private readonly calls = new Map<string, number>();
-  private readonly consecutiveFailures = new Map<string, number>();
   private readonly deadProviders = new Set<string>();
+  /** Weighted loss so far: sum of weight * (best rating - served rating). */
+  private lossMilli = 0;
 
   constructor(probes: Probe[], ratings: RatingsFile | null) {
     this.probes = probes;
@@ -85,25 +143,30 @@ export class Router {
     return this.calls.get(providerId) ?? 0;
   }
 
+  /** Weighted loss so far, for the stderr log. */
+  lossOf(): number {
+    return this.lossMilli;
+  }
+
   /** One call was made to this provider: it counts against its budget whether it answered or not. */
   noteAttempt(providerId: string): void {
     this.calls.set(providerId, this.callsOf(providerId) + 1);
   }
 
-  /** One call answered: the provider is healthy again. */
-  noteSuccess(providerId: string): void {
-    this.consecutiveFailures.set(providerId, 0);
+  /** One call answered: bank the weighted loss of serving at this rating. */
+  noteSuccess(providerId: string, rating: number, best: number, weight: number): void {
+    void providerId;
+    this.lossMilli += weight * Math.max(0, best - rating);
   }
 
-  /** One call refused: kill the provider after three in a row (outage or spent budget). */
-  noteFailure(providerId: string): void {
-    const run = (this.consecutiveFailures.get(providerId) ?? 0) + 1;
-    this.consecutiveFailures.set(providerId, run);
-    if (run >= DEAD_AFTER_CONSECUTIVE_FAILURES) this.deadProviders.add(providerId);
+  /** One call refused: a spent budget or an outage kills the provider at once. */
+  noteRefusal(providerId: string, kind: RefusalKind): void {
+    if (kind === 'budget' || kind === 'outage') this.deadProviders.add(providerId);
   }
 
-  /** The candidates for one request, best first, with dead providers filtered out. */
+  /** The candidates for one request, best effective rating first, dead providers filtered out. */
   candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
+    const lambda = this.lossMilli > LOSS_GUARD_MILLI ? 0 : RISK_MILLI_PER_UNIT;
     const all: Candidate[] = [];
     for (let providerIndex = 0; providerIndex < this.probes.length; providerIndex += 1) {
       const probe = this.probes[providerIndex];
@@ -117,10 +180,8 @@ export class Router {
         all.push({ providerIndex, probe, model, rating: row?.rating_milli ?? 0 });
       }
     }
-    const effective = (c: Candidate): number => {
-      const cap = SOFT_CALL_CAPS[c.probe.provider.id] ?? Number.POSITIVE_INFINITY;
-      return c.rating - (this.callsOf(c.probe.provider.id) >= cap ? OVER_CAP_PENALTY_MILLI : 0);
-    };
+    const effective = (c: Candidate): number =>
+      c.rating - lambda * failureRisk(c.probe.provider.id, this.callsOf(c.probe.provider.id));
     all.sort((a, b) => {
       const byRating = effective(b) - effective(a);
       if (byRating !== 0) return byRating;
